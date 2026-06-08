@@ -5,8 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from libsql_client import Client, ClientSync, create_client, create_client_sync
-
+from libsql_client import Client, create_client, create_client_sync
 load_dotenv()
 TURSO_URL = os.environ["TURSO_URL"]
 TURSO_AUTH_TOKEN = os.environ["TURSO_AUTH_TOKEN"]
@@ -88,8 +87,8 @@ CATEGORY_SETTINGS = {
 }
 
 
-def _create_sync_client() -> ClientSync:
-    return create_client_sync(TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
+# def _create_sync_client() -> ClientSync:
+#     return create_client_sync(TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
 
 
 def _create_async_client() -> Client:
@@ -581,7 +580,44 @@ async def generate_wrapped(period: str) -> Any:
         return {"status": "error", "message": str(exc)}
 
 
-init_db()
+@mcp.on_startup
+async def startup():
+    async with _create_async_client() as client:
+        await client.execute("""
+            CREATE TABLE IF NOT EXISTS movies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                type TEXT NOT NULL,
+                genre TEXT NOT NULL,
+                status TEXT NOT NULL,
+                rating REAL,
+                date_added TEXT NOT NULL,
+                notes TEXT DEFAULT ''
+            )
+        """)
+        await client.execute("""
+            CREATE TABLE IF NOT EXISTS games (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                genre TEXT NOT NULL,
+                status TEXT NOT NULL,
+                rating REAL,
+                date_added TEXT NOT NULL,
+                notes TEXT DEFAULT ''
+            )
+        """)
+        await client.execute("""
+            CREATE TABLE IF NOT EXISTS books (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                author TEXT NOT NULL,
+                genre TEXT NOT NULL,
+                status TEXT NOT NULL,
+                rating REAL,
+                date_added TEXT NOT NULL,
+                notes TEXT DEFAULT ''
+            )
+        """)
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)
