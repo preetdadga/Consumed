@@ -64,9 +64,17 @@ async def _execute(sql: str, params: Tuple = ()) -> Dict:
             headers={"Authorization": f"Bearer {TURSO_AUTH_TOKEN}"},
             timeout=10,
         )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            print(f"[Turso ERROR] {resp.status_code}: {resp.text}")
+            resp.raise_for_status()
         data = resp.json()
-        result = data["results"][0]["response"]["result"]
+        # Turso can return a 200 but still have an error inside the result
+        result_wrapper = data["results"][0]
+        if result_wrapper.get("type") == "error":
+            error_msg = result_wrapper.get("error", {}).get("message", "Unknown Turso error")
+            print(f"[Turso RESULT ERROR] {error_msg}")
+            raise RuntimeError(error_msg)
+        result = result_wrapper["response"]["result"]
         return result
 
 
