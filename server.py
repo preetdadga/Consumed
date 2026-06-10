@@ -4,22 +4,82 @@ from contextlib import asynccontextmanager
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from libsql_client import Client, create_client
 
 load_dotenv()
 TURSO_URL = os.environ["TURSO_URL"]
 TURSO_AUTH_TOKEN = os.environ["TURSO_AUTH_TOKEN"]
+TURSO_PIPELINE_URL = f"{TURSO_URL}/v2/pipeline"
+
+CATEGORY_SETTINGS = {
+    "movies": {
+        "table": "movies",
+        "status_values": {"watching", "completed", "dropped"},
+        "in_progress": {"watching"},
+    },
+    "games": {
+        "table": "games",
+        "status_values": {"playing", "completed", "dropped"},
+        "in_progress": {"playing"},
+    },
+    "books": {
+        "table": "books",
+        "status_values": {"reading", "completed", "dropped"},
+        "in_progress": {"reading"},
+    },
+}
 
 
-def _create_async_client() -> Client:
-    return create_client(TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
+# --- Turso HTTP API helpers ---
+
+def _make_arg(value: Any) -> Dict:
+    if value is None:
+        return {"type": "null", "value": None}
+    if isinstance(value, int):
+        return {"type": "integer", "value": str(value)}
+    if isinstance(value, float):
+        return {"type": "float", "value": str(value)}
+    return {"type": "text", "value": str(value)}
 
 
-def _row_to_dict(columns: Tuple[str, ...], row: Any) -> Dict[str, Any]:
-    return {columns[index]: row[index] for index in range(len(columns))}
+async def _execute(sql: str, params: Tuple = ()) -> Dict:
+    payload = {
+        "requests": [
+            {
+                "type": "execute",
+                "stmt": {
+                    "sql": sql,
+                    "args": [_make_arg(p) for p in params],
+                },
+            },
+            {"type": "close"},
+        ]
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            TURSO_PIPELINE_URL,
+            json=payload,
+            headers={"Authorization": f"Bearer {TURSO_AUTH_TOKEN}"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        result = data["results"][0]["response"]["result"]
+        return result
 
+
+async def _fetch_rows(sql: str, params: Tuple = ()) -> List[Dict[str, Any]]:
+    result = await _execute(sql, params)
+    cols = [c["name"] for c in result["cols"]]
+    return [
+        {cols[i]: (row[i]["value"] if row[i]["type"] != "null" else None) for i in range(len(cols))}
+        for row in result["rows"]
+    ]
+
+
+# --- Normalizers ---
 
 def _get_table(category: str) -> str:
     if category not in CATEGORY_SETTINGS:
@@ -28,131 +88,72 @@ def _get_table(category: str) -> str:
 
 
 def _normalize_status(category: str, status: str) -> str:
-    status_str = status.strip().lower()
-    if status_str not in CATEGORY_SETTINGS[category]["status_values"]:
+    s = status.strip().lower()
+    if s not in CATEGORY_SETTINGS[category]["status_values"]:
         raise ValueError(f"Invalid status for {category}: {status}")
-    return status_str
+    return s
 
 
-def _normalize_genre(category: str, genre: str) -> str:
-    genre_str = genre.strip()
-    if not genre_str:
+def _normalize_genre(genre: str) -> str:
+    g = genre.strip()
+    if not g:
         raise ValueError("Genre must not be empty")
-    return genre_str
+    return g
 
 
 def _normalize_type(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
-    normalized = value.strip().lower()
-    if normalized not in {"film", "series"}:
+    n = value.strip().lower()
+    if n not in {"film", "series"}:
         raise ValueError("Movie type must be 'film' or 'series'")
-    return normalized
+    return n
 
 
 def _normalize_author(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
-    author = value.strip()
-    if not author:
+    a = value.strip()
+    if not a:
         raise ValueError("Author must not be empty")
-    return author
+    return a
 
 
 def _normalize_rating(value: Optional[float]) -> Optional[float]:
     if value is None:
         return None
-    rating = float(value)
-    if rating < 1 or rating > 10:
+    r = float(value)
+    if r < 1 or r > 10:
         raise ValueError("Rating must be between 1 and 10")
-    return rating
+    return r
 
 
-def _normalize_date(date_added: Optional[str]) -> str:
-    if not date_added:
+def _normalize_date(value: Optional[str]) -> str:
+    if not value:
         return date.today().isoformat()
-    return date_added.strip()
+    return value.strip()
 
 
 def _get_period_start(period: str) -> Optional[str]:
     today = date.today()
-    period = period.strip().lower()
-    if period == "all":
+    p = period.strip().lower()
+    if p == "all":
         return None
-    if period == "this_year":
+    if p == "this_year":
         return date(today.year, 1, 1).isoformat()
-    if period == "this_month":
+    if p == "this_month":
         return date(today.year, today.month, 1).isoformat()
-    if period == "this_quarter":
+    if p == "this_quarter":
         quarter = (today.month - 1) // 3
         return date(today.year, quarter * 3 + 1, 1).isoformat()
     raise ValueError(f"Invalid period: {period}")
 
 
-CATEGORY_SETTINGS = {
-    "movies": {
-        "table": "movies",
-        "status_values": {"watching", "completed", "dropped"},
-        "in_progress": {"watching"},
-        "extra_columns": ["type"],
-    },
-    "games": {
-        "table": "games",
-        "status_values": {"playing", "completed", "dropped"},
-        "in_progress": {"playing"},
-        "extra_columns": [],
-    },
-    "books": {
-        "table": "books",
-        "status_values": {"reading", "completed", "dropped"},
-        "in_progress": {"reading"},
-        "extra_columns": ["author"],
-    },
-}
-
-
-@asynccontextmanager
-async def lifespan(server):
-    async with _create_async_client() as client:
-        await client.execute("""
-            CREATE TABLE IF NOT EXISTS movies (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                type TEXT NOT NULL,
-                genre TEXT NOT NULL,
-                status TEXT NOT NULL,
-                rating REAL,
-                date_added TEXT NOT NULL,
-                notes TEXT DEFAULT ''
-            )
-        """)
-        await client.execute("""
-            CREATE TABLE IF NOT EXISTS games (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                genre TEXT NOT NULL,
-                status TEXT NOT NULL,
-                rating REAL,
-                date_added TEXT NOT NULL,
-                notes TEXT DEFAULT ''
-            )
-        """)
-        await client.execute("""
-            CREATE TABLE IF NOT EXISTS books (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                author TEXT NOT NULL,
-                genre TEXT NOT NULL,
-                status TEXT NOT NULL,
-                rating REAL,
-                date_added TEXT NOT NULL,
-                notes TEXT DEFAULT ''
-            )
-        """)
-        yield
-
-
-mcp = FastMCP("Consumed", lifespan=lifespan)
+def _period_filter(period: str) -> Tuple[str, Tuple]:
+    start = _get_period_start(period)
+    if start is None:
+        return "", ()
+    return "WHERE date_added >= ?", (start,)
 
 
 def _load_genres(category: str) -> List[str]:
@@ -160,6 +161,53 @@ def _load_genres(category: str) -> List[str]:
     with open(genre_file, "r") as f:
         return json.load(f)
 
+
+# --- Lifespan: create tables on startup ---
+
+@asynccontextmanager
+async def lifespan(server):
+    await _execute("""
+        CREATE TABLE IF NOT EXISTS movies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            type TEXT NOT NULL,
+            genre TEXT NOT NULL,
+            status TEXT NOT NULL,
+            rating REAL,
+            date_added TEXT NOT NULL,
+            notes TEXT DEFAULT ''
+        )
+    """)
+    await _execute("""
+        CREATE TABLE IF NOT EXISTS games (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            genre TEXT NOT NULL,
+            status TEXT NOT NULL,
+            rating REAL,
+            date_added TEXT NOT NULL,
+            notes TEXT DEFAULT ''
+        )
+    """)
+    await _execute("""
+        CREATE TABLE IF NOT EXISTS books (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            author TEXT NOT NULL,
+            genre TEXT NOT NULL,
+            status TEXT NOT NULL,
+            rating REAL,
+            date_added TEXT NOT NULL,
+            notes TEXT DEFAULT ''
+        )
+    """)
+    yield
+
+
+mcp = FastMCP("Consumed", lifespan=lifespan)
+
+
+# --- Resources ---
 
 @mcp.resource("consumed://genres/movies")
 def genres_movies() -> List[str]:
@@ -176,11 +224,7 @@ def genres_books() -> List[str]:
     return _load_genres("books")
 
 
-async def _fetch_entries(query: str, params: Tuple[Any, ...]) -> List[Dict[str, Any]]:
-    async with _create_async_client() as client:
-        result = await client.execute(query, params)
-        return [_row_to_dict(result.columns, row) for row in result.rows]
-
+# --- Tools ---
 
 @mcp.tool("add_entry")
 async def add_entry(
@@ -196,45 +240,40 @@ async def add_entry(
 ) -> Dict[str, Any]:
     try:
         category = category.strip().lower()
-        table = _get_table(category)
+        _get_table(category)
         title_value = title.strip()
-        genre_value = _normalize_genre(category, genre)
+        if not title_value:
+            raise ValueError("Title must not be empty")
+
+        genre_value = _normalize_genre(genre)
         status_value = _normalize_status(category, status)
         date_value = _normalize_date(date_added)
         rating_value = _normalize_rating(rating)
         notes_value = notes or ""
 
-        if not title_value:
-            raise ValueError("Title must not be empty")
-
         if category == "movies":
             type_value = _normalize_type(type)
             if type_value is None:
                 raise ValueError("Movie type is required")
-            query = (
-                "INSERT INTO movies (title, type, genre, status, rating, date_added, notes) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)"
+            result = await _execute(
+                "INSERT INTO movies (title, type, genre, status, rating, date_added, notes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (title_value, type_value, genre_value, status_value, rating_value, date_value, notes_value),
             )
-            params = (title_value, type_value, genre_value, status_value, rating_value, date_value, notes_value)
         elif category == "games":
-            query = (
-                "INSERT INTO games (title, genre, status, rating, date_added, notes) "
-                "VALUES (?, ?, ?, ?, ?, ?)"
+            result = await _execute(
+                "INSERT INTO games (title, genre, status, rating, date_added, notes) VALUES (?, ?, ?, ?, ?, ?)",
+                (title_value, genre_value, status_value, rating_value, date_value, notes_value),
             )
-            params = (title_value, genre_value, status_value, rating_value, date_value, notes_value)
         else:
             author_value = _normalize_author(author)
             if author_value is None:
                 raise ValueError("Book author is required")
-            query = (
-                "INSERT INTO books (title, author, genre, status, rating, date_added, notes) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)"
+            result = await _execute(
+                "INSERT INTO books (title, author, genre, status, rating, date_added, notes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (title_value, author_value, genre_value, status_value, rating_value, date_value, notes_value),
             )
-            params = (title_value, author_value, genre_value, status_value, rating_value, date_value, notes_value)
 
-        async with _create_async_client() as client:
-            result = await client.execute(query, params)
-            return {"status": "success", "id": result.last_insert_rowid}
+        return {"status": "success", "id": result.get("last_insert_rowid")}
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
@@ -259,44 +298,44 @@ async def update_entry(
         values: List[Any] = []
 
         if title is not None:
-            title_value = title.strip()
-            if not title_value:
+            t = title.strip()
+            if not t:
                 raise ValueError("Title must not be empty")
             updates.append("title = ?")
-            values.append(title_value)
+            values.append(t)
         if genre is not None:
-            values.append(_normalize_genre(category, genre))
             updates.append("genre = ?")
+            values.append(_normalize_genre(genre))
         if status is not None:
-            values.append(_normalize_status(category, status))
             updates.append("status = ?")
+            values.append(_normalize_status(category, status))
         if rating is not None:
-            values.append(_normalize_rating(rating))
             updates.append("rating = ?")
+            values.append(_normalize_rating(rating))
         if notes is not None:
-            values.append(notes)
             updates.append("notes = ?")
+            values.append(notes)
         if date_added is not None:
-            values.append(_normalize_date(date_added))
             updates.append("date_added = ?")
+            values.append(_normalize_date(date_added))
         if category == "movies" and type is not None:
-            values.append(_normalize_type(type))
             updates.append("type = ?")
+            values.append(_normalize_type(type))
         if category == "books" and author is not None:
-            values.append(_normalize_author(author))
             updates.append("author = ?")
+            values.append(_normalize_author(author))
 
         if not updates:
             return {"status": "success", "message": "No fields to update"}
 
-        query = f"UPDATE {table} SET {', '.join(updates)} WHERE id = ?"
         values.append(id)
-
-        async with _create_async_client() as client:
-            result = await client.execute(query, tuple(values))
-            if result.rows_affected == 0:
-                return {"status": "error", "message": "Entry not found"}
-            return {"status": "success"}
+        result = await _execute(
+            f"UPDATE {table} SET {', '.join(updates)} WHERE id = ?",
+            tuple(values),
+        )
+        if result.get("affected_row_count", 0) == 0:
+            return {"status": "error", "message": "Entry not found"}
+        return {"status": "success"}
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
@@ -305,12 +344,10 @@ async def update_entry(
 async def delete_entry(category: str, id: int) -> Dict[str, Any]:
     try:
         table = _get_table(category.strip().lower())
-        query = f"DELETE FROM {table} WHERE id = ?"
-        async with _create_async_client() as client:
-            result = await client.execute(query, (id,))
-            if result.rows_affected == 0:
-                return {"status": "error", "message": "Entry not found"}
-            return {"status": "success"}
+        result = await _execute(f"DELETE FROM {table} WHERE id = ?", (id,))
+        if result.get("affected_row_count", 0) == 0:
+            return {"status": "error", "message": "Entry not found"}
+        return {"status": "success"}
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
@@ -319,8 +356,10 @@ async def delete_entry(category: str, id: int) -> Dict[str, Any]:
 async def search_entries(category: str, query: str) -> Any:
     try:
         table = _get_table(category.strip().lower())
-        sql = f"SELECT * FROM {table} WHERE LOWER(title) LIKE ? ORDER BY date_added DESC"
-        return await _fetch_entries(sql, (f"%{query.strip().lower()}%",))
+        return await _fetch_rows(
+            f"SELECT * FROM {table} WHERE LOWER(title) LIKE ? ORDER BY date_added DESC",
+            (f"%{query.strip().lower()}%",),
+        )
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
@@ -343,80 +382,68 @@ async def get_all(
             values.append(_normalize_status(cat, status))
         if genre is not None:
             filters.append("genre = ?")
-            values.append(_normalize_genre(cat, genre))
+            values.append(_normalize_genre(genre))
         if min_rating is not None:
-            values.append(_normalize_rating(min_rating))
             filters.append("rating >= ?")
+            values.append(_normalize_rating(min_rating))
 
-        where_clause = " AND ".join(filters)
-        if where_clause:
-            where_clause = "WHERE " + where_clause
-
-        sql = f"SELECT * FROM {table} {where_clause} ORDER BY date_added DESC"
-        return await _fetch_entries(sql, tuple(values))
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        return await _fetch_rows(
+            f"SELECT * FROM {table} {where} ORDER BY date_added DESC",
+            tuple(values),
+        )
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
 
-async def _get_range_filter(period: str) -> Tuple[str, Tuple[Any, ...]]:
-    start = _get_period_start(period)
-    if start is None:
-        return "", ()
-    return "WHERE date_added >= ?", (start,)
-
-
-async def _get_stats_for_category(category: str, period: str) -> Dict[str, Any]:
+async def _stats_for_category(category: str, period: str) -> Dict[str, Any]:
     table = _get_table(category)
-    filter_clause, filter_params = await _get_range_filter(period)
+    filter_clause, filter_params = _period_filter(period)
+    aw = "AND" if filter_clause else "WHERE"
 
-    async with _create_async_client() as client:
-        total_result = await client.execute(
-            f"SELECT COUNT(*) FROM {table} {filter_clause}", filter_params
+    total_rows = await _fetch_rows(f"SELECT COUNT(*) as cnt FROM {table} {filter_clause}", filter_params)
+    total = total_rows[0]["cnt"]
+
+    status_counts = {}
+    for s in CATEGORY_SETTINGS[category]["status_values"]:
+        rows = await _fetch_rows(
+            f"SELECT COUNT(*) as cnt FROM {table} {filter_clause} {aw} status = ?",
+            (*filter_params, s),
         )
-        total = total_result.rows[0][0]
+        status_counts[s] = rows[0]["cnt"]
 
-        status_counts = {}
-        for status_name in CATEGORY_SETTINGS[category]["status_values"]:
-            and_or_where = "AND" if filter_clause else "WHERE"
-            result = await client.execute(
-                f"SELECT COUNT(*) FROM {table} {filter_clause} {and_or_where} status = ?",
-                (*filter_params, status_name),
-            )
-            status_counts[status_name] = result.rows[0][0]
+    avg_rows = await _fetch_rows(
+        f"SELECT AVG(rating) as avg FROM {table} {filter_clause} {aw} rating IS NOT NULL",
+        filter_params,
+    )
+    avg_rating = avg_rows[0]["avg"]
+    avg_rating = float(avg_rating) if avg_rating is not None else None
 
-        and_or_where = "AND" if filter_clause else "WHERE"
-        rating_result = await client.execute(
-            f"SELECT AVG(rating) FROM {table} {filter_clause} {and_or_where} rating IS NOT NULL",
-            filter_params,
-        )
-        avg_rating = rating_result.rows[0][0]
-        avg_rating = float(avg_rating) if avg_rating is not None else None
+    breakdown_rows = await _fetch_rows(
+        f"SELECT genre, COUNT(*) as cnt FROM {table} {filter_clause} GROUP BY genre ORDER BY cnt DESC",
+        filter_params,
+    )
+    genre_breakdown = {r["genre"]: r["cnt"] for r in breakdown_rows}
 
-        breakdown_result = await client.execute(
-            f"SELECT genre, COUNT(*) FROM {table} {filter_clause} GROUP BY genre ORDER BY COUNT(*) DESC",
-            filter_params,
-        )
-        genre_breakdown = {row[0]: row[1] for row in breakdown_result.rows}
+    top_rows = await _fetch_rows(
+        f"SELECT * FROM {table} {filter_clause} {aw} rating IS NOT NULL ORDER BY rating DESC, date_added DESC LIMIT 1",
+        filter_params,
+    )
+    top_rated = top_rows[0] if top_rows else None
 
-        top_result = await client.execute(
-            f"SELECT * FROM {table} {filter_clause} {and_or_where} rating IS NOT NULL ORDER BY rating DESC, date_added DESC LIMIT 1",
-            filter_params,
-        )
-        top_rated = _row_to_dict(top_result.columns, top_result.rows[0]) if top_result.rows else None
+    in_progress = sum(
+        status_counts[s] for s in CATEGORY_SETTINGS[category]["in_progress"] if s in status_counts
+    )
 
-        in_progress_count = sum(
-            status_counts[s] for s in CATEGORY_SETTINGS[category]["in_progress"] if s in status_counts
-        )
-
-        return {
-            "total": total,
-            "completed": status_counts.get("completed", 0),
-            "dropped": status_counts.get("dropped", 0),
-            "in_progress": in_progress_count,
-            "average_rating": avg_rating,
-            "breakdown_by_genre": genre_breakdown,
-            "top_rated_entry": top_rated,
-        }
+    return {
+        "total": total,
+        "completed": status_counts.get("completed", 0),
+        "dropped": status_counts.get("dropped", 0),
+        "in_progress": in_progress,
+        "average_rating": avg_rating,
+        "breakdown_by_genre": genre_breakdown,
+        "top_rated_entry": top_rated,
+    }
 
 
 @mcp.tool("get_stats")
@@ -425,44 +452,45 @@ async def get_stats(category: str, period: str) -> Any:
         cat = category.strip().lower()
         if cat not in CATEGORY_SETTINGS:
             raise ValueError(f"Invalid category: {category}")
-        return await _get_stats_for_category(cat, period)
+        return await _stats_for_category(cat, period)
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
 
-async def _get_most_common_genre(category: str, period: str) -> Optional[str]:
+async def _most_common_genre(category: str, period: str) -> Optional[str]:
     table = _get_table(category)
-    filter_clause, filter_params = await _get_range_filter(period)
-    async with _create_async_client() as client:
-        result = await client.execute(
-            f"SELECT genre, COUNT(*) FROM {table} {filter_clause} GROUP BY genre ORDER BY COUNT(*) DESC LIMIT 1",
+    filter_clause, filter_params = _period_filter(period)
+    rows = await _fetch_rows(
+        f"SELECT genre, COUNT(*) as cnt FROM {table} {filter_clause} GROUP BY genre ORDER BY cnt DESC LIMIT 1",
+        filter_params,
+    )
+    return rows[0]["genre"] if rows else None
+
+
+async def _overall_avg_rating(period: str) -> Optional[float]:
+    filter_clause, filter_params = _period_filter(period)
+    aw = "AND" if filter_clause else "WHERE"
+    all_ratings = []
+    for table in ("movies", "games", "books"):
+        rows = await _fetch_rows(
+            f"SELECT rating FROM {table} {filter_clause} {aw} rating IS NOT NULL",
             filter_params,
         )
-        return result.rows[0][0] if result.rows else None
-
-
-async def _get_overall_average_rating(period: str) -> Optional[float]:
-    filter_clause, filter_params = await _get_range_filter(period)
-    and_or_where = "AND" if filter_clause else "WHERE"
-    async with _create_async_client() as client:
-        ratings: List[float] = []
-        for table in ("movies", "games", "books"):
-            sql = f"SELECT rating FROM {table} {filter_clause} {and_or_where} rating IS NOT NULL"
-            result = await client.execute(sql, filter_params)
-            ratings.extend([row[0] for row in result.rows])
-    if not ratings:
+        all_ratings.extend([float(r["rating"]) for r in rows])
+    if not all_ratings:
         return None
-    return float(sum(ratings) / len(ratings))
+    return float(sum(all_ratings) / len(all_ratings))
 
 
-async def _count_completed_items(category: str, period: str) -> int:
+async def _count_completed(category: str, period: str) -> int:
     table = _get_table(category)
-    filter_clause, filter_params = await _get_range_filter(period)
-    and_or_where = "AND" if filter_clause else "WHERE"
-    sql = f"SELECT COUNT(*) FROM {table} {filter_clause} {and_or_where} status = 'completed'"
-    async with _create_async_client() as client:
-        result = await client.execute(sql, filter_params)
-        return int(result.rows[0][0])
+    filter_clause, filter_params = _period_filter(period)
+    aw = "AND" if filter_clause else "WHERE"
+    rows = await _fetch_rows(
+        f"SELECT COUNT(*) as cnt FROM {table} {filter_clause} {aw} status = 'completed'",
+        filter_params,
+    )
+    return int(rows[0]["cnt"])
 
 
 @mcp.tool("generate_wrapped")
@@ -471,27 +499,27 @@ async def generate_wrapped(period: str) -> Any:
         categories = ["movies", "games", "books"]
         category_stats = {}
         total_consumed = 0
-        counts = {}
+        counts: Dict[str, int] = {}
 
         for category in categories:
-            stats = await _get_stats_for_category(category, period)
+            stats = await _stats_for_category(category, period)
             category_stats[category] = {
                 "total": stats["total"],
                 "completed": stats["completed"],
                 "average_rating": stats["average_rating"],
                 "top_rated_entry": stats["top_rated_entry"],
-                "most_common_genre": await _get_most_common_genre(category, period),
+                "most_common_genre": await _most_common_genre(category, period),
             }
             counts[category] = stats["total"]
-            total_consumed += await _count_completed_items(category, period)
+            total_consumed += await _count_completed(category, period)
 
         most_active = max(counts, key=counts.get) if counts else None
-        overall_avg_rating = await _get_overall_average_rating(period)
+        overall_avg = await _overall_avg_rating(period)
 
         return {
             "period": period,
             "most_active_category": most_active,
-            "overall_average_rating": overall_avg_rating,
+            "overall_average_rating": overall_avg,
             "total_items_consumed": total_consumed,
             "categories": category_stats,
         }
