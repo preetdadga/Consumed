@@ -11,7 +11,7 @@ Built with [FastMCP](https://gofastmcp.com), deployed on [FastMCP Cloud](https:/
 Log everything you watch, play, and read — then ask Claude to analyze it. No forms, no dashboards. Just talk to Claude naturally and it handles the rest.
 
 ```
-"Add Interstellar as a completed film, Sci-Fi, 9.5/10"
+"I watched intersteller today, one of the best films i ever watched, easily top 3, rating it a solid 9.5"
 "What games have I dropped this year?"
 "Generate my wrapped report for this month"
 "What's my average rating across all books?"
