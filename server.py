@@ -1,133 +1,16 @@
 import json
 import os
+from contextlib import asynccontextmanager
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
-from contextlib import asynccontextmanager
+
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from libsql_client import Client, ClientSync, create_client, create_client_sync
+from libsql_client import Client, create_client
+
 load_dotenv()
 TURSO_URL = os.environ["TURSO_URL"]
 TURSO_AUTH_TOKEN = os.environ["TURSO_AUTH_TOKEN"]
-@asynccontextmanager
-async def lifespan(server):
-    async with _create_async_client() as client:
-        await client.execute("""
-            CREATE TABLE IF NOT EXISTS movies (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                type TEXT NOT NULL,
-                genre TEXT NOT NULL,
-                status TEXT NOT NULL,
-                rating REAL,
-                date_added TEXT NOT NULL,
-                notes TEXT DEFAULT ''
-            )
-        """)
-        await client.execute("""
-            CREATE TABLE IF NOT EXISTS games (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                genre TEXT NOT NULL,
-                status TEXT NOT NULL,
-                rating REAL,
-                date_added TEXT NOT NULL,
-                notes TEXT DEFAULT ''
-            )
-        """)
-        await client.execute("""
-            CREATE TABLE IF NOT EXISTS books (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                author TEXT NOT NULL,
-                genre TEXT NOT NULL,
-                status TEXT NOT NULL,
-                rating REAL,
-                date_added TEXT NOT NULL,
-                notes TEXT DEFAULT ''
-            )
-        """)
-        yield
-
-mcp = FastMCP("Consumed", lifespan=lifespan)
-
-GENRES = {
-    "movies": [
-        "Action",
-        "Adventure",
-        "Animation",
-        "Comedy",
-        "Crime",
-        "Documentary",
-        "Drama",
-        "Fantasy",
-        "Horror",
-        "Mystery",
-        "Romance",
-        "Sci-Fi",
-        "Thriller",
-        "Biography",
-        "Historical",
-    ],
-    "games": [
-        "Action",
-        "RPG",
-        "Strategy",
-        "Simulation",
-        "Sports",
-        "Puzzle",
-        "Horror",
-        "Adventure",
-        "Fighting",
-        "Platformer",
-        "Shooter",
-        "Indie",
-        "MOBA",
-        "Racing",
-    ],
-    "books": [
-        "Fiction",
-        "Non-Fiction",
-        "Fantasy",
-        "Sci-Fi",
-        "Mystery",
-        "Thriller",
-        "Romance",
-        "Biography",
-        "History",
-        "Self-Help",
-        "Horror",
-        "Adventure",
-        "Philosophy",
-        "Science",
-        "Classic",
-    ],
-}
-
-CATEGORY_SETTINGS = {
-    "movies": {
-        "table": "movies",
-        "status_values": {"watching", "completed", "dropped"},
-        "in_progress": {"watching"},
-        "extra_columns": ["type"],
-    },
-    "games": {
-        "table": "games",
-        "status_values": {"playing", "completed", "dropped"},
-        "in_progress": {"playing"},
-        "extra_columns": [],
-    },
-    "books": {
-        "table": "books",
-        "status_values": {"reading", "completed", "dropped"},
-        "in_progress": {"reading"},
-        "extra_columns": ["author"],
-    },
-}
-
-
-def _create_sync_client() -> ClientSync:
-    return create_client_sync(TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
 
 
 def _create_async_client() -> Client:
@@ -206,10 +89,32 @@ def _get_period_start(period: str) -> Optional[str]:
     raise ValueError(f"Invalid period: {period}")
 
 
-def init_db() -> None:
-    with _create_sync_client() as client:
-        client.execute(
-            """
+CATEGORY_SETTINGS = {
+    "movies": {
+        "table": "movies",
+        "status_values": {"watching", "completed", "dropped"},
+        "in_progress": {"watching"},
+        "extra_columns": ["type"],
+    },
+    "games": {
+        "table": "games",
+        "status_values": {"playing", "completed", "dropped"},
+        "in_progress": {"playing"},
+        "extra_columns": [],
+    },
+    "books": {
+        "table": "books",
+        "status_values": {"reading", "completed", "dropped"},
+        "in_progress": {"reading"},
+        "extra_columns": ["author"],
+    },
+}
+
+
+@asynccontextmanager
+async def lifespan(server):
+    async with _create_async_client() as client:
+        await client.execute("""
             CREATE TABLE IF NOT EXISTS movies (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
@@ -220,10 +125,8 @@ def init_db() -> None:
                 date_added TEXT NOT NULL,
                 notes TEXT DEFAULT ''
             )
-            """
-        )
-        client.execute(
-            """
+        """)
+        await client.execute("""
             CREATE TABLE IF NOT EXISTS games (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
@@ -233,10 +136,8 @@ def init_db() -> None:
                 date_added TEXT NOT NULL,
                 notes TEXT DEFAULT ''
             )
-            """
-        )
-        client.execute(
-            """
+        """)
+        await client.execute("""
             CREATE TABLE IF NOT EXISTS books (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
@@ -247,25 +148,11 @@ def init_db() -> None:
                 date_added TEXT NOT NULL,
                 notes TEXT DEFAULT ''
             )
-            """
-        )
+        """)
+        yield
 
 
-def _get_current_genre_list(category: str) -> List[str]:
-    if category not in GENRES:
-        raise ValueError(f"Invalid genre category: {category}")
-    return GENRES[category]
-
-
-async def _fetch_entries(query: str, params: Tuple[Any, ...]) -> List[Dict[str, Any]]:
-    async with _create_async_client() as client:
-        result = await client.execute(query, params)
-        return [_row_to_dict(result.columns, row) for row in result.rows]
-
-
-async def _fetch_single_entry(query: str, params: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
-    rows = await _fetch_entries(query, params)
-    return rows[0] if rows else None
+mcp = FastMCP("Consumed", lifespan=lifespan)
 
 
 def _load_genres(category: str) -> List[str]:
@@ -287,6 +174,12 @@ def genres_games() -> List[str]:
 @mcp.resource("consumed://genres/books")
 def genres_books() -> List[str]:
     return _load_genres("books")
+
+
+async def _fetch_entries(query: str, params: Tuple[Any, ...]) -> List[Dict[str, Any]]:
+    async with _create_async_client() as client:
+        result = await client.execute(query, params)
+        return [_row_to_dict(result.columns, row) for row in result.rows]
 
 
 @mcp.tool("add_entry")
@@ -477,19 +370,23 @@ async def _get_stats_for_category(category: str, period: str) -> Dict[str, Any]:
     filter_clause, filter_params = await _get_range_filter(period)
 
     async with _create_async_client() as client:
-        total_result = await client.execute(f"SELECT COUNT(*) FROM {table} {filter_clause}", filter_params)
+        total_result = await client.execute(
+            f"SELECT COUNT(*) FROM {table} {filter_clause}", filter_params
+        )
         total = total_result.rows[0][0]
 
         status_counts = {}
         for status_name in CATEGORY_SETTINGS[category]["status_values"]:
+            and_or_where = "AND" if filter_clause else "WHERE"
             result = await client.execute(
-                f"SELECT COUNT(*) FROM {table} {filter_clause + (' AND status = ?' if filter_clause else 'WHERE status = ?')}",
+                f"SELECT COUNT(*) FROM {table} {filter_clause} {and_or_where} status = ?",
                 (*filter_params, status_name),
             )
             status_counts[status_name] = result.rows[0][0]
 
+        and_or_where = "AND" if filter_clause else "WHERE"
         rating_result = await client.execute(
-            f"SELECT AVG(rating) FROM {table} {filter_clause} AND rating IS NOT NULL" if filter_clause else f"SELECT AVG(rating) FROM {table} WHERE rating IS NOT NULL",
+            f"SELECT AVG(rating) FROM {table} {filter_clause} {and_or_where} rating IS NOT NULL",
             filter_params,
         )
         avg_rating = rating_result.rows[0][0]
@@ -501,13 +398,11 @@ async def _get_stats_for_category(category: str, period: str) -> Dict[str, Any]:
         )
         genre_breakdown = {row[0]: row[1] for row in breakdown_result.rows}
 
-        top_rated = None
         top_result = await client.execute(
-            f"SELECT * FROM {table} {filter_clause + (' AND' if filter_clause else 'WHERE')} rating IS NOT NULL ORDER BY rating DESC, date_added DESC LIMIT 1",
+            f"SELECT * FROM {table} {filter_clause} {and_or_where} rating IS NOT NULL ORDER BY rating DESC, date_added DESC LIMIT 1",
             filter_params,
         )
-        if top_result.rows:
-            top_rated = _row_to_dict(top_result.columns, top_result.rows[0])
+        top_rated = _row_to_dict(top_result.columns, top_result.rows[0]) if top_result.rows else None
 
         in_progress_count = sum(
             status_counts[s] for s in CATEGORY_SETTINGS[category]["in_progress"] if s in status_counts
@@ -543,32 +438,16 @@ async def _get_most_common_genre(category: str, period: str) -> Optional[str]:
             f"SELECT genre, COUNT(*) FROM {table} {filter_clause} GROUP BY genre ORDER BY COUNT(*) DESC LIMIT 1",
             filter_params,
         )
-        if not result.rows:
-            return None
-        return result.rows[0][0]
+        return result.rows[0][0] if result.rows else None
 
 
 async def _get_overall_average_rating(period: str) -> Optional[float]:
-    if period.strip().lower() == "all":
-        expressions = [
-            "SELECT rating FROM movies WHERE rating IS NOT NULL",
-            "SELECT rating FROM games WHERE rating IS NOT NULL",
-            "SELECT rating FROM books WHERE rating IS NOT NULL",
-        ]
-        all_ratings = []
-        async with _create_async_client() as client:
-            for sql in expressions:
-                result = await client.execute(sql, ())
-                all_ratings.extend([row[0] for row in result.rows])
-        if not all_ratings:
-            return None
-        return float(sum(all_ratings) / len(all_ratings))
-
     filter_clause, filter_params = await _get_range_filter(period)
+    and_or_where = "AND" if filter_clause else "WHERE"
     async with _create_async_client() as client:
         ratings: List[float] = []
         for table in ("movies", "games", "books"):
-            sql = f"SELECT rating FROM {table} {filter_clause} AND rating IS NOT NULL" if filter_clause else f"SELECT rating FROM {table} WHERE rating IS NOT NULL"
+            sql = f"SELECT rating FROM {table} {filter_clause} {and_or_where} rating IS NOT NULL"
             result = await client.execute(sql, filter_params)
             ratings.extend([row[0] for row in result.rows])
     if not ratings:
@@ -579,7 +458,8 @@ async def _get_overall_average_rating(period: str) -> Optional[float]:
 async def _count_completed_items(category: str, period: str) -> int:
     table = _get_table(category)
     filter_clause, filter_params = await _get_range_filter(period)
-    sql = f"SELECT COUNT(*) FROM {table} {filter_clause + (' AND' if filter_clause else 'WHERE')} status = 'completed'"
+    and_or_where = "AND" if filter_clause else "WHERE"
+    sql = f"SELECT COUNT(*) FROM {table} {filter_clause} {and_or_where} status = 'completed'"
     async with _create_async_client() as client:
         result = await client.execute(sql, filter_params)
         return int(result.rows[0][0])
@@ -617,12 +497,6 @@ async def generate_wrapped(period: str) -> Any:
         }
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
-
-
-
-
-
-
 
 
 if __name__ == "__main__":
