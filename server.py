@@ -68,7 +68,6 @@ async def _execute(sql: str, params: Tuple = ()) -> Dict:
             print(f"[Turso ERROR] {resp.status_code}: {resp.text}")
             resp.raise_for_status()
         data = resp.json()
-        # Turso can return a 200 but still have an error inside the result
         result_wrapper = data["results"][0]
         if result_wrapper.get("type") == "error":
             error_msg = result_wrapper.get("error", {}).get("message", "Unknown Turso error")
@@ -501,25 +500,51 @@ async def _count_completed(category: str, period: str) -> int:
     return int(rows[0]["cnt"])
 
 
-@mcp.tool("generate_wrapped")
+@mcp.tool(
+    "generate_wrapped",
+    description="""Fetches all consumption data for a wrapped report.
+
+IMPORTANT — after calling this tool, you MUST:
+1. Study the raw_entries and stats carefully
+2. Generate 4-5 deeply personal insights about the user's taste and patterns.
+   Insights should feel like observations from someone who studied the user —
+   not generic stats. Cross-reference data points. Examples of the right tone:
+   - 'You dropped Dark after S2 but still gave it 8.5. You respected it even when it lost you.'
+   - 'You gave Nolan 5 chances and he never disappointed you once. That's not a favourite director, that's trust.'
+   - 'Every book you picked up, you finished. No drops, no pauses. That's rare.'
+   Be specific, use actual titles, ratings, and notes from the data.
+3. Then call generate_wrapped_html with the stats AND your generated insights list.
+   Do not show the raw data to the user — go straight to generate_wrapped_html."""
+)
 async def generate_wrapped(period: str) -> Any:
     try:
         categories = ["movies", "games", "books"]
         category_stats = {}
         total_consumed = 0
         counts: Dict[str, int] = {}
+        raw_entries: Dict[str, List] = {}
 
         for category in categories:
             stats = await _stats_for_category(category, period)
             category_stats[category] = {
                 "total": stats["total"],
                 "completed": stats["completed"],
+                "dropped": stats["dropped"],
+                "in_progress": stats["in_progress"],
                 "average_rating": stats["average_rating"],
                 "top_rated_entry": stats["top_rated_entry"],
                 "most_common_genre": await _most_common_genre(category, period),
+                "breakdown_by_genre": stats["breakdown_by_genre"],
             }
             counts[category] = stats["total"]
             total_consumed += await _count_completed(category, period)
+
+            table = _get_table(category)
+            filter_clause, filter_params = _period_filter(period)
+            raw_entries[category] = await _fetch_rows(
+                f"SELECT * FROM {table} {filter_clause} ORDER BY date_added DESC",
+                filter_params,
+            )
 
         most_active = max(counts, key=counts.get) if counts else None
         overall_avg = await _overall_avg_rating(period)
@@ -530,7 +555,251 @@ async def generate_wrapped(period: str) -> Any:
             "overall_average_rating": overall_avg,
             "total_items_consumed": total_consumed,
             "categories": category_stats,
+            "raw_entries": raw_entries,
         }
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+@mcp.tool(
+    "generate_wrapped_html",
+    description="Renders the wrapped report as a beautiful HTML page. Call this after generate_wrapped and after generating personal insights. Pass the full stats dict and the insights list you generated."
+)
+async def generate_wrapped_html(
+    period: str,
+    stats: Dict[str, Any],
+    insights: List[str],
+    username: str = "preet dadga",
+) -> Dict[str, Any]:
+    try:
+        cats = stats.get("categories", {})
+        movies = cats.get("movies", {})
+        games = cats.get("games", {})
+        books = cats.get("books", {})
+
+        total_entries = (movies.get("total", 0) or 0) + (games.get("total", 0) or 0) + (books.get("total", 0) or 0)
+        total_completed = stats.get("total_items_consumed", 0) or 0
+        overall_avg = stats.get("overall_average_rating")
+        overall_avg_str = f"{overall_avg:.1f}" if overall_avg else "—"
+        most_active = stats.get("most_active_category", "—") or "—"
+
+        def top_title(cat_data):
+            t = cat_data.get("top_rated_entry")
+            if not t:
+                return "—"
+            return t.get("title", "—")
+
+        def top_rating(cat_data):
+            t = cat_data.get("top_rated_entry")
+            if not t or t.get("rating") is None:
+                return ""
+            return f"{t['rating']}/10"
+
+        def avg_str(cat_data):
+            a = cat_data.get("average_rating")
+            return f"{a:.1f}" if a else "—"
+
+        def genre_bars(cat_data, color):
+            breakdown = cat_data.get("breakdown_by_genre", {})
+            if not breakdown:
+                return ""
+            max_cnt = max(breakdown.values()) if breakdown else 1
+            bars = ""
+            for genre, cnt in list(breakdown.items())[:4]:
+                pct = int((cnt / max_cnt) * 100)
+                bars += f"""
+                <div style="margin-bottom:10px">
+                  <div style="display:flex;justify-content:space-between;font-size:12px;color:#555;margin-bottom:4px">
+                    <span style="color:#888">{genre}</span>
+                    <span style="color:{color}">{cnt}</span>
+                  </div>
+                  <div style="height:3px;background:#1e1e1e;border-radius:2px">
+                    <div style="width:{pct}%;height:100%;background:{color};border-radius:2px"></div>
+                  </div>
+                </div>"""
+            return bars
+
+        insights_html = ""
+        for insight in insights:
+            insights_html += f"""
+            <div style="padding:1.25rem 0;border-bottom:1px solid #161616">
+              <p style="font-size:15px;color:#ccc;line-height:1.6;margin:0">{insight}</p>
+            </div>"""
+
+        period_label = {
+            "all": "all time",
+            "this_year": "this year",
+            "this_month": "this month",
+            "this_quarter": "this quarter",
+        }.get(period.lower(), period)
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Consumed — Wrapped</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *{{margin:0;padding:0;box-sizing:border-box}}
+  body{{background:#0a0a0a;color:#f0f0f0;font-family:'Inter',sans-serif;min-height:100vh}}
+  .page{{max-width:680px;margin:0 auto;padding:2rem 1.5rem 5rem}}
+  .header{{text-align:center;padding:4rem 0 2.5rem}}
+  .eyebrow{{font-size:10px;letter-spacing:0.25em;text-transform:uppercase;color:#444;margin-bottom:1rem}}
+  .logo{{font-size:3.5rem;font-weight:700;letter-spacing:-0.04em;color:#fff;line-height:1}}
+  .logo span{{color:#c9a96e}}
+  .header-sub{{font-size:13px;color:#444;margin-top:0.75rem;letter-spacing:0.05em}}
+  .divider{{height:1px;background:linear-gradient(90deg,transparent,#1e1e1e,transparent);margin:2.5rem 0}}
+  .section-label{{font-size:10px;letter-spacing:0.2em;text-transform:uppercase;color:#333;margin-bottom:1rem}}
+  .stat-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:#151515;border-radius:12px;overflow:hidden;margin-bottom:1px}}
+  .stat-cell{{background:#0f0f0f;padding:1.5rem 1rem;text-align:center}}
+  .stat-num{{font-size:2.25rem;font-weight:700;letter-spacing:-0.04em;line-height:1}}
+  .stat-lbl{{font-size:10px;color:#333;margin-top:6px;text-transform:uppercase;letter-spacing:0.15em}}
+  .highlight-grid{{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:#151515;border-radius:12px;overflow:hidden}}
+  .hcard{{background:#0f0f0f;padding:1.25rem;position:relative;overflow:hidden}}
+  .hcard::before{{content:'';position:absolute;top:0;left:0;right:0;height:2px}}
+  .hcard-tag{{font-size:9px;letter-spacing:0.15em;text-transform:uppercase;color:#333;margin-bottom:0.5rem}}
+  .hcard-title{{font-size:14px;font-weight:600;color:#ddd;line-height:1.3;margin-bottom:0.25rem}}
+  .hcard-sub{{font-size:12px;color:#444;line-height:1.4}}
+  .wide-card{{background:#0f0f0f;border-radius:12px;padding:1.5rem;position:relative;overflow:hidden}}
+  .wide-card::before{{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:#c9a96e}}
+  .cat-grid{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:#151515;border-radius:12px;overflow:hidden;margin-bottom:1px}}
+  .cat-cell{{background:#0f0f0f;padding:1.25rem 1rem}}
+  .cat-label{{font-size:9px;letter-spacing:0.18em;text-transform:uppercase;color:#333;margin-bottom:0.75rem}}
+  .cat-top{{font-size:13px;font-weight:600;color:#ddd;margin-bottom:0.25rem;line-height:1.3}}
+  .cat-rating{{font-size:11px;margin-bottom:0.25rem}}
+  .cat-avg{{font-size:11px;color:#444}}
+  .insights-section{{background:#0f0f0f;border-radius:12px;overflow:hidden;padding:0 1.5rem}}
+  .insights-section .hcard-tag{{padding-top:1.5rem}}
+  .insight-item:last-child{{border-bottom:none!important}}
+  .currently-list{{background:#151515;border-radius:12px;overflow:hidden}}
+  .currently-item{{background:#0f0f0f;padding:1rem 1.25rem;display:flex;align-items:center;gap:1rem;border-bottom:1px solid #151515}}
+  .currently-item:last-child{{border-bottom:none}}
+  .dot{{width:7px;height:7px;border-radius:50%;flex-shrink:0}}
+  .footer{{text-align:center;margin-top:4rem}}
+  .footer-text{{font-size:10px;color:#222;letter-spacing:0.15em;text-transform:uppercase}}
+  @keyframes fadeUp{{from{{opacity:0;transform:translateY(16px)}}to{{opacity:1;transform:translateY(0)}}}}
+  .fade{{opacity:0;animation:fadeUp 0.6s ease forwards}}
+  .d1{{animation-delay:0.05s}}.d2{{animation-delay:0.15s}}.d3{{animation-delay:0.25s}}
+  .d4{{animation-delay:0.35s}}.d5{{animation-delay:0.45s}}.d6{{animation-delay:0.55s}}
+  .d7{{animation-delay:0.65s}}.d8{{animation-delay:0.75s}}.d9{{animation-delay:0.85s}}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div class="header fade d1">
+    <div class="eyebrow">your {period_label} in review</div>
+    <div class="logo">con<span>sumed</span></div>
+    <div class="header-sub">{username} &nbsp;·&nbsp; {period_label} &nbsp;·&nbsp; {total_entries} entries logged</div>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="section-label fade d2">overview</div>
+  <div class="stat-grid fade d2">
+    <div class="stat-cell">
+      <div class="stat-num" style="color:#c9a96e">{movies.get('total', 0)}</div>
+      <div class="stat-lbl">films &amp; series</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-num" style="color:#6ec9c9">{games.get('total', 0)}</div>
+      <div class="stat-lbl">games</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-num" style="color:#c96e8a">{books.get('total', 0)}</div>
+      <div class="stat-lbl">books</div>
+    </div>
+  </div>
+  <div class="stat-grid fade d3" style="margin-top:1px">
+    <div class="stat-cell">
+      <div class="stat-num" style="color:#fff">{total_completed}</div>
+      <div class="stat-lbl">completed</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-num" style="color:#fff">{overall_avg_str}</div>
+      <div class="stat-lbl">avg rating</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-num" style="color:#fff;font-size:1.5rem">{most_active}</div>
+      <div class="stat-lbl">most active</div>
+    </div>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="section-label fade d4">top picks</div>
+  <div class="cat-grid fade d4">
+    <div class="cat-cell">
+      <div class="cat-label" style="color:#c9a96e44;color:#555">🎬 film & series</div>
+      <div class="cat-top">{top_title(movies)}</div>
+      <div class="cat-rating" style="color:#c9a96e">{top_rating(movies)}</div>
+      <div class="cat-avg">avg {avg_str(movies)}</div>
+    </div>
+    <div class="cat-cell">
+      <div class="cat-label" style="color:#555">🎮 games</div>
+      <div class="cat-top">{top_title(games)}</div>
+      <div class="cat-rating" style="color:#6ec9c9">{top_rating(games)}</div>
+      <div class="cat-avg">avg {avg_str(games)}</div>
+    </div>
+    <div class="cat-cell">
+      <div class="cat-label" style="color:#555">📚 books</div>
+      <div class="cat-top">{top_title(books)}</div>
+      <div class="cat-rating" style="color:#c96e8a">{top_rating(books)}</div>
+      <div class="cat-avg">avg {avg_str(books)}</div>
+    </div>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="section-label fade d5">your taste</div>
+  <div class="wide-card fade d5" style="margin-bottom:1px">
+    <div style="font-size:11px;color:#444;margin-bottom:1rem;letter-spacing:0.1em;text-transform:uppercase">films &amp; series</div>
+    {genre_bars(movies, '#c9a96e')}
+  </div>
+  <div class="wide-card fade d5" style="margin-bottom:1px;--accent:#6ec9c9">
+    <div style="font-size:11px;color:#444;margin-bottom:1rem;letter-spacing:0.1em;text-transform:uppercase">games</div>
+    {genre_bars(games, '#6ec9c9')}
+  </div>
+  <div class="wide-card fade d6" style="--accent:#c96e8a">
+    <div style="font-size:11px;color:#444;margin-bottom:1rem;letter-spacing:0.1em;text-transform:uppercase">books</div>
+    {genre_bars(books, '#c96e8a')}
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="section-label fade d7">what consumed says about you</div>
+  <div class="insights-section fade d7">
+    <div class="hcard-tag" style="padding-top:1.5rem;padding-bottom:0.5rem;color:#333">observations</div>
+    {insights_html}
+    <div style="height:1.5rem"></div>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="footer fade d9">
+    <div class="footer-text">consumed &nbsp;·&nbsp; {username} &nbsp;·&nbsp; {period_label} &nbsp;·&nbsp; {total_entries} entries</div>
+  </div>
+
+</div>
+<script>
+document.querySelectorAll('.counter').forEach(el => {{
+  const target = parseInt(el.dataset.target);
+  const dur = 1000;
+  const start = performance.now();
+  function tick(now) {{
+    const p = Math.min((now - start) / dur, 1);
+    const e = 1 - Math.pow(1 - p, 3);
+    el.textContent = Math.round(e * target);
+    if (p < 1) requestAnimationFrame(tick);
+  }}
+  requestAnimationFrame(tick);
+}});
+</script>
+</body>
+</html>"""
+
+        return {"html": html, "filename": f"consumed-wrapped-{period}.html"}
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
