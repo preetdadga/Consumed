@@ -40,7 +40,7 @@ def _make_arg(value: Any) -> Dict:
     if isinstance(value, int):
         return {"type": "integer", "value": str(value)}
     if isinstance(value, float):
-        return {"type": "float", "value": value}
+        return {"type": "float", "value": str(value)}  
     return {"type": "text", "value": str(value)}
 
 
@@ -409,7 +409,7 @@ async def _stats_for_category(category: str, period: str) -> Dict[str, Any]:
     aw = "AND" if filter_clause else "WHERE"
 
     total_rows = await _fetch_rows(f"SELECT COUNT(*) as cnt FROM {table} {filter_clause}", filter_params)
-    total = total_rows[0]["cnt"]
+    total = int(total_rows[0]["cnt"])
 
     status_counts = {}
     for s in CATEGORY_SETTINGS[category]["status_values"]:
@@ -417,7 +417,7 @@ async def _stats_for_category(category: str, period: str) -> Dict[str, Any]:
             f"SELECT COUNT(*) as cnt FROM {table} {filter_clause} {aw} status = ?",
             (*filter_params, s),
         )
-        status_counts[s] = rows[0]["cnt"]
+        status_counts[s] = int(rows[0]["cnt"])
 
     avg_rows = await _fetch_rows(
         f"SELECT AVG(rating) as avg FROM {table} {filter_clause} {aw} rating IS NOT NULL",
@@ -430,7 +430,7 @@ async def _stats_for_category(category: str, period: str) -> Dict[str, Any]:
         f"SELECT genre, COUNT(*) as cnt FROM {table} {filter_clause} GROUP BY genre ORDER BY cnt DESC",
         filter_params,
     )
-    genre_breakdown = {r["genre"]: r["cnt"] for r in breakdown_rows}
+    genre_breakdown = {r["genre"]: int(r["cnt"]) for r in breakdown_rows}
 
     top_rows = await _fetch_rows(
         f"SELECT * FROM {table} {filter_clause} {aw} rating IS NOT NULL ORDER BY rating DESC, date_added DESC LIMIT 1",
